@@ -9,7 +9,6 @@ TART's resolution of about 7 degrees.
 import erfa
 import numpy as np
 
-_UNIX_EPOCH_JD = 2440587.5
 _SECONDS_PER_DAY = 86400.0
 
 
@@ -55,10 +54,26 @@ def itrs_to_enu(itrs: np.ndarray, lat_deg: float, lon_deg: float, alt_m: float) 
 
 
 def _utc_two_part(time: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Split unix seconds into an ERFA two-part UTC Julian date (whole day, fraction of day)."""
+    """Convert unix seconds to an ERFA two-part UTC quasi Julian date.
+
+    Built from calendar fields with ``erfa.dtf2d``, so that a day containing a leap second correctly has
+    86401 s in ERFA's quasi-JD convention (dividing seconds-of-day by 86400 would be off by up to 1 s).
+    """
     time = np.asarray(time, dtype=np.float64)
     days = np.floor(time / _SECONDS_PER_DAY)
-    return _UNIX_EPOCH_JD + days, (time - days * _SECONDS_PER_DAY) / _SECONDS_PER_DAY
+    seconds = time - days * _SECONDS_PER_DAY
+    date = days.astype(np.int64).astype("datetime64[D]")
+    month = date.astype("datetime64[M]")
+    year = month.astype("datetime64[Y]").astype(np.int32) + 1970
+    return erfa.dtf2d(
+        "UTC",
+        year,
+        month.astype(np.int32) % 12 + 1,
+        (date - month).astype(np.int32) + 1,
+        (seconds // 3600).astype(np.int32),
+        (seconds % 3600 // 60).astype(np.int32),
+        seconds % 60,
+    )
 
 
 def zenith_radec(
@@ -111,13 +126,20 @@ def uvw_basis(ra: np.ndarray, dec: np.ndarray) -> np.ndarray:
     )
 
 
+def uvw_rotation(time: np.ndarray, ra: np.ndarray, dec: np.ndarray, dut1: float = 0.0) -> np.ndarray:
+    """Return the ``(n_time, 3, 3)`` matrices mapping an ITRS vector to (u, v, w) toward each (ra, dec).
+
+    The vector is rotated from ITRS into the celestial frame at its time (Earth rotation plus precession and
+    nutation), then projected onto the (u, v, w) basis of that time's phase centre.
+    """
+    # v_itrs = R @ v_gcrs, so the (u, v, w) components of an ITRS vector are basis @ R.T @ v_itrs.
+    return uvw_basis(ra, dec) @ np.swapaxes(celestial_to_terrestrial(time, dut1), -1, -2)
+
+
 def baseline_uvw(
     baselines_itrs: np.ndarray, time: np.ndarray, ra: np.ndarray, dec: np.ndarray, dut1: float = 0.0
 ) -> np.ndarray:
-    """Project ITRS baseline vectors onto each time's (u, v, w) basis.
-
-    Each baseline is rotated from ITRS into the celestial frame at its time (Earth rotation plus
-    precession and nutation), then projected onto the (u, v, w) basis of that time's phase centre.
+    """Project ITRS baseline vectors onto each time's (u, v, w) basis (see :func:`uvw_rotation`).
 
     Args:
         baselines_itrs: ``(n_baseline, 3)`` ITRS baseline vectors in metres.
@@ -129,6 +151,23 @@ def baseline_uvw(
     Returns:
         ``(n_time, n_baseline, 3)`` UVW in metres.
     """
-    # v_itrs = R @ v_gcrs, so the (u, v, w) components of an ITRS vector are basis @ R.T @ v_itrs.
-    rot = uvw_basis(ra, dec) @ np.swapaxes(celestial_to_terrestrial(time, dut1), -1, -2)
+    rot = uvw_rotation(time, ra, dec, dut1)
     return np.einsum("tij,bj->tbi", rot, np.asarray(baselines_itrs, dtype=np.float64))
+
+
+def uvw_rows(
+    rot: np.ndarray, baselines_itrs: np.ndarray, scan_index: np.ndarray, t: np.ndarray, b: np.ndarray
+) -> np.ndarray:
+    """Return UVW for snapshot indices ``t`` and baseline indices ``b``.
+
+    Args:
+        rot: ``(n_time, 3, 3)`` matrices from :func:`uvw_rotation`.
+        baselines_itrs: ``(n_scan, n_baseline, 3)`` ITRS baselines of each file, in metres.
+        scan_index: ``(n_time,)`` file index of each snapshot.
+        t: Snapshot indices.
+        b: Baseline indices.
+
+    Returns:
+        ``(t.size, b.size, 3)`` UVW in metres.
+    """
+    return np.einsum("tij,tbj->tbi", rot[t], baselines_itrs[scan_index[t]][:, b])

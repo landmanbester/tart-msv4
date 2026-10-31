@@ -18,6 +18,8 @@ which allows a direct value comparison with no rephasing:
 - **FLAG:** tart2ms flags nothing. tart-msv4 flags the baselines of the dead antenna (gain 0).
 """
 
+import warnings
+
 import numpy as np
 import pytest
 import xarray as xr
@@ -37,7 +39,8 @@ def _partition(dt: xr.DataTree) -> xr.DataTree:
 @pytest.fixture(scope="module")
 def reference(ref_ms) -> xr.DataTree:
     pytest.importorskip("xarray_ms")
-    with pytest.warns():  # xarray-ms warns about imputed STATE/PROCESSOR rows and the ITRF UVW frame
+    with warnings.catch_warnings():  # xarray-ms warns about imputed STATE/PROCESSOR rows and the UVW frame
+        warnings.simplefilter("ignore")
         return _partition(xr.open_datatree(str(ref_ms), engine="xarray-ms:msv2"))
 
 
@@ -51,13 +54,20 @@ def mid(generated) -> int:
     return generated.ds.sizes["time"] // 2
 
 
-def test_check_datatree(generated) -> None:
+def _checker():
     check = pytest.importorskip("xradio.schema.check")
+    import xradio.measurement_set  # noqa: F401  (registers the MSv4 schemas with the checker)
+
+    return check
+
+
+def test_check_datatree(generated) -> None:
+    check = _checker()
     assert not check.check_datatree(generated.root)
 
 
 def test_check_datatree_all_bundled_files(bundle_hdfs) -> None:
-    check = pytest.importorskip("xradio.schema.check")
+    check = _checker()
     dt = tart_msv4.open_tart(bundle_hdfs)
     assert not check.check_datatree(dt)
     ds = _partition(dt).ds

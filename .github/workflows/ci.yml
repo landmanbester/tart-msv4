@@ -9,10 +9,10 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
-      - run: uv run --only-group dev ruff format --check .
-      - run: uv run --only-group dev ruff check .
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+      # Every pre-commit hook (ruff, YAML/TOML/whitespace checks), so skipping hooks locally is caught here.
+      - run: uv run --only-group dev pre-commit run --all-files --show-diff-on-failure
 
   test:
     runs-on: ubuntu-latest
@@ -20,11 +20,16 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.12", "3.13"]
+    env:
+      TART_MSV4_REQUIRE_DATA: "1"  # real-data tests fail instead of skipping when the bundle is missing
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
         with:
           python-version: ${{ matrix.python-version }}
-      - run: uv sync
-      # Real-data tests download the bundle; they skip (not fail) if the download is unavailable.
+      - uses: actions/cache@v6
+        with:
+          path: tests/data
+          key: tart-bundle-1vENbb8wQatHCNwO6LODXgPDwchcHzo7m
+      - run: uv sync --locked
       - run: uv run pytest -rs

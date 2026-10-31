@@ -14,12 +14,17 @@ from typing import Any
 import h5py
 import numpy as np
 import xarray as xr
-from xarray.backends import BackendArray, BackendEntrypoint, CachingFileManager
+from xarray.backends import BackendEntrypoint, CachingFileManager
 from xarray.backends.locks import HDF5_LOCK
-from xarray.core import indexing
+
+from tart_msv4.lazy import GridArray, lazy
 
 PathLike = str | os.PathLike
 _SIGNATURE = ("vis", "baselines", "config", "timestamp")
+# xarray forwards its CF decoding options to every backend; TART data has nothing to decode.
+_IGNORED_DECODERS = frozenset(
+    {"mask_and_scale", "decode_times", "decode_timedelta", "use_cftime", "concat_characters", "decode_coords"}
+)
 
 
 def parse_timestamps(raw: Iterable[bytes | str]) -> np.ndarray:
@@ -34,11 +39,18 @@ def parse_timestamps(raw: Iterable[bytes | str]) -> np.ndarray:
 
 
 def read_metadata(path: PathLike) -> dict[str, Any]:
-    """Eagerly read the small arrays of a TART file (everything except ``vis``)."""
+    """Eagerly read the small arrays of a TART file (everything except ``vis``).
+
+    The path is made absolute, so lazy reads still work after a ``chdir`` or on a worker.
+
+    Raises:
+        ValueError: If the shape of ``vis`` disagrees with ``timestamp`` and ``baselines``.
+    """
+    path = os.path.abspath(os.path.expanduser(os.fspath(path)))
     with h5py.File(path, "r") as f:
         raw_config = f["config"][0]
-        return {
-            "path": os.fspath(path),
+        meta = {
+            "path": path,
             "config": json.loads(raw_config.decode() if isinstance(raw_config, bytes) else raw_config),
             "time": parse_timestamps(f["timestamp"][:]),
             "antenna_positions": f["antenna_positions"][:].astype(np.float64),
@@ -47,9 +59,13 @@ def read_metadata(path: PathLike) -> dict[str, Any]:
             "phases": f["phases"][:].astype(np.float64),
             "vis_shape": f["vis"].shape,
         }
+    expected = (meta["time"].size, len(meta["baselines"]))
+    if tuple(meta["vis_shape"]) != expected:
+        raise ValueError(f"{path}: vis has shape {meta['vis_shape']}, expected (n_timestamp, n_baseline) = {expected}")
+    return meta
 
 
-class TartVisibilityArray(BackendArray):
+class TartVisibilityArray(GridArray):
     """Lazy ``(time, baseline_id, frequency, polarization)`` view over the ``vis`` datasets of TART files.
 
     Each file is opened through a :class:`~xarray.backends.CachingFileManager`, so the array pickles cleanly
@@ -62,33 +78,21 @@ class TartVisibilityArray(BackendArray):
         self.shape = (int(self.offsets[-1]), int(n_baseline), 1, 1)
         self.dtype = np.dtype(np.complex64)
 
-    def __getitem__(self, key: indexing.ExplicitIndexer) -> np.ndarray:
-        return indexing.explicit_indexing_adapter(key, self.shape, indexing.IndexingSupport.OUTER, self._raw_getitem)
-
-    def _raw_getitem(self, key: tuple) -> np.ndarray:
-        t_key, b_key, f_key, p_key = key
-        t = np.arange(self.shape[0])[t_key]
-        b = np.arange(self.shape[1])[b_key]
-        t1, b1 = np.atleast_1d(t), np.atleast_1d(b)
-        out = np.empty((t1.size, b1.size), dtype=self.dtype)
-        if t1.size and b1.size:
-            b_lo, b_hi = b1.min(), b1.max() + 1
+    def _block(self, t: np.ndarray, b: np.ndarray) -> np.ndarray:
+        out = np.empty((t.size, b.size), dtype=self.dtype)
+        if t.size and b.size:
+            b_lo, b_hi = b.min(), b.max() + 1
             for i, manager in enumerate(self.managers):
                 lo, hi = self.offsets[i], self.offsets[i + 1]
-                sel = np.flatnonzero((t1 >= lo) & (t1 < hi))
+                sel = np.flatnonzero((t >= lo) & (t < hi))
                 if not sel.size:
                     continue
-                rows = t1[sel] - lo
+                rows = t[sel] - lo
                 # h5py reads one contiguous block; the outer selection is applied in memory.
                 with HDF5_LOCK:
                     block = manager.acquire()["vis"][rows.min() : rows.max() + 1, b_lo:b_hi]
-                out[sel] = _to_complex(block)[np.ix_(rows - rows.min(), b1 - b_lo)]
-        out = out[:, :, None, None][:, :, f_key][..., p_key]
-        if np.ndim(b) == 0:
-            out = out[:, 0]
-        if np.ndim(t) == 0:
-            out = out[0]
-        return out
+                out[sel] = _to_complex(block)[np.ix_(rows - rows.min(), b - b_lo)]
+        return out[:, :, None, None]
 
 
 def _to_complex(block: np.ndarray) -> np.ndarray:
@@ -109,10 +113,10 @@ def open_tart_groups(
 ) -> dict[str, xr.Dataset]:
     """Open one or more TART files of a single observation as a dict of MSv4 groups.
 
-    Files are sorted by their first timestamp. They must share ``config`` and ``baselines`` exactly, while
-    their ``antenna_positions`` may differ by up to ``position_tolerance``: TART recalibrates positions along
-    with gains, so UVW is computed with each file's own positions. ``vis`` stays lazy; every other array is
-    small and read eagerly.
+    Files are sorted by their first timestamp and must not overlap in time. They must share ``config`` and
+    ``baselines`` exactly, while their ``antenna_positions`` may differ by up to ``position_tolerance``: TART
+    recalibrates positions along with gains, so UVW is computed with each file's own positions. Arrays on the
+    (time, baseline) grid stay lazy; the small per-file metadata is read eagerly.
 
     Args:
         paths: One file path or a sequence of file paths. Globs and directories are not expanded.
@@ -126,9 +130,9 @@ def open_tart_groups(
         Mapping from DataTree group path to dataset.
 
     Raises:
-        ValueError: If no paths are given or the files do not share one configuration.
+        ValueError: If no paths are given, a file is malformed, files overlap in time (or repeat), or they do
+            not share one configuration.
     """
-    from tart_msv4 import __version__
     from tart_msv4.schema import build_msv4_groups  # deferred: imports pyerfa
 
     paths = [paths] if isinstance(paths, (str, os.PathLike)) else list(paths)
@@ -138,10 +142,14 @@ def open_tart_groups(
     _check_compatible(metas, position_tolerance)
 
     first = metas[0]
+    for prev, meta in zip(metas, metas[1:]):
+        if meta["time"][0] <= prev["time"][-1]:
+            raise ValueError(f"TART files overlap in time (or repeat): {prev['path']} and {meta['path']}")
+
     vis = TartVisibilityArray([m["path"] for m in metas], [m["time"].size for m in metas], first["vis_shape"][1])
     name = partition_name or f"{Path(first['path']).stem}_partition_000"
     groups = build_msv4_groups(
-        indexing.LazilyIndexedArray(vis),
+        lazy(vis),
         np.concatenate([m["time"] for m in metas]),
         np.concatenate([np.full(m["time"].size, i) for i, m in enumerate(metas)]),
         first["config"],
@@ -152,9 +160,7 @@ def open_tart_groups(
         partition_name=name,
         creation_date=creation_date,
         dut1=dut1,
-        software_version=__version__,
     )
-    groups[f"/{name}"]["VISIBILITY"].encoding["preferred_chunks"] = {"time": tuple(m["time"].size for m in metas)}
     if drop_variables is not None:
         drop = [drop_variables] if isinstance(drop_variables, str) else list(drop_variables)
         groups = {k: ds.drop_vars(drop, errors="ignore") for k, ds in groups.items()}
@@ -202,12 +208,14 @@ def open_tart(
 
 
 def _chunk(ds: xr.Dataset, chunks: int | dict | str) -> xr.Dataset:
-    """Chunk a group, defaulting ``{}`` to the per-file ``time`` chunks recorded on VISIBILITY."""
+    """Chunk a group; ``{}`` means one ``time`` chunk per file (scan) in the visibility partition."""
     if not ds.data_vars:
         return ds
     if isinstance(chunks, dict):
-        if not chunks and "VISIBILITY" in ds:
-            chunks = ds["VISIBILITY"].encoding["preferred_chunks"]
+        if not chunks and "scan_name" in ds.coords:
+            scans = ds["scan_name"].values
+            starts = np.flatnonzero(np.r_[True, scans[1:] != scans[:-1]])
+            chunks = {"time": tuple(np.diff(np.r_[starts, scans.size]))}
         chunks = {k: v for k, v in chunks.items() if k in ds.dims}
     return ds.chunk(chunks)
 
@@ -242,8 +250,15 @@ class TartBackendEntrypoint(BackendEntrypoint):
         partition_name: str | None = None,
         creation_date: str | None = None,
         dut1: float = 0.0,
+        **decoders: Any,
     ) -> dict[str, xr.Dataset]:
-        """Open a single TART file as a dict of MSv4 groups (see :func:`open_tart_groups`)."""
+        """Open a single TART file as a dict of MSv4 groups (see :func:`open_tart_groups`).
+
+        xarray's CF decoding options (``decode_times`` etc.) are accepted and ignored.
+        """
+        unknown = set(decoders) - _IGNORED_DECODERS
+        if unknown:
+            raise TypeError(f"engine='tart' got unexpected keyword arguments {sorted(unknown)}")
         return open_tart_groups(
             _single_path(filename_or_obj),
             drop_variables=drop_variables,
@@ -265,10 +280,7 @@ class TartBackendEntrypoint(BackendEntrypoint):
 def _single_path(filename_or_obj: Any) -> str:
     """Validate that the backend was given one existing file (directories and globs are rejected)."""
     if not isinstance(filename_or_obj, (str, os.PathLike)):
-        raise ValueError(
-            f"engine='tart' needs a file path, got {type(filename_or_obj).__name__}; "
-            "use tart_msv4.open_tart for several files"
-        )
+        raise ValueError(f"engine='tart' needs a file path, got {type(filename_or_obj).__name__}")
     path = os.path.expanduser(os.fspath(filename_or_obj))
     if not os.path.isfile(path):
         raise FileNotFoundError(f"not a file: {path!r} (use tart_msv4.open_tart for several files)")

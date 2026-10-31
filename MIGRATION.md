@@ -6,7 +6,8 @@
 2. Replace `read_hdf_as_msv4(path)` with `xr.open_datatree(path, engine="tart")` for one file, or with
    `tart_msv4.open_tart(paths)` for several files of one observation.
 3. Delete `read_hdf_as_msv4`, `_geodetic_to_ecef` and `_enu_to_ecef`. tart-msv4 provides
-   `tart_msv4.geometry.enu_to_itrs`, `itrs_to_enu`, `geodetic_to_itrs`, `zenith_radec` and `baseline_uvw`.
+   `enu_to_itrs`, `itrs_to_enu`, `geodetic_to_itrs`, `zenith_radec` and `baseline_uvw` in
+   `tart_msv4.geometry` (`from tart_msv4 import geometry`).
 
 ## Intended differences
 
@@ -19,7 +20,7 @@ and ANTENNA_POSITION are identical (positions to 1e-9 m).
 | Fields | one field `"zenith"` for every snapshot | one field per snapshot, `zenith_<UTC ISO µs>` |
 | `field_and_source_base_xds` | `PHASE_CENTER_ELAZ` [[90, 0]] on `elaz_label`, attr `phase_center_convention` | `FIELD_PHASE_CENTER_DIRECTION(field_name, sky_dir_label)` = ICRS (ra, dec) of the zenith per snapshot, `{type: sky_coord, units: rad, frame: fk5}` |
 | `scan_name` | `"1"` | `scan_<first snapshot ISO>` per file, `scan_intents=["OBSERVE_TARGET#ON_SOURCE"]` |
-| UVW frame | ENU baselines, `frame: "ENU-zenith"`, constant in time | fk5 (u, v, w) toward each snapshot's own zenith, varying in time. w = 0 to < 1 mm; (u, v) are ENU rotated by about 0.3° (precession) |
+| UVW frame | ENU baselines, `frame: "ENU-zenith"`, constant in time | fk5 (u, v, w) toward each snapshot's own zenith, varying in time. w = 0 to < 1 mm; (u, v) are ENU rotated by about 0.16° (precession and nutation since J2000, for 2026) |
 | UVW sign | pos(ant1) − pos(ant2) (never checked) | pos(ant1) − pos(ant2), **checked** against the tart2ms MS ([ADR 2](docs/adr/0002-uvw-sign-ant1-minus-ant2.md)) |
 | VISIBILITY units | `"1"` | `"dimensionless"` (the spelling the MSv4 schema itself uses) plus a `description` |
 | Required attrs | no `creation_date`, `observation_info` missing `observer`/`release_date`/`project_UID`, `frequency` missing `spectral_window_*`, `time`-like vars without attrs | all present; passes `xradio.schema.check.check_datatree` |
@@ -38,10 +39,10 @@ and ANTENNA_POSITION are identical (positions to 1e-9 m).
   - `rephase_to_dir`, `_instantaneous_zenith`: the current phase centre per snapshot is
     `FIELD_PHASE_CENTER_DIRECTION` indexed by `field_name(time)`, and the current UVW is `UVW` as read.
     Drop the astropy recomputation of `s_old`/`uvw_cur`. Note that `_project_baselines` uses the ITRS pole
-    as "north", which leaves out precession (about 1.8 cm on TART baselines). The `UVW` from tart-msv4 is
+    as "north", which leaves out precession (about 0.9 cm on TART's longest, 3.4 m baseline). The `UVW` from tart-msv4 is
     correct in fk5.
   - `itrs_baselines`: with multi-file trees, `antenna_xds` holds only the **first** file's positions. Use
-    `UVW` directly, or per-file positions from `tart_msv4.geometry.enu_to_itrs(gain_xds.ANTENNA_POSITION_ENU[i], ...)`.
+    `UVW` directly, or per-file positions from `geometry.enu_to_itrs(gain_xds.ANTENNA_POSITION_ENU[i], ...)`.
   - `_rebuild`: keep writing the rephased result as a new field `"phasecenter"`. Ideally put it in a
     separate data group (e.g. `data_groups["rephased"]` with its own `field_and_source_rephased_xds`) instead
     of overwriting `base`.
@@ -51,7 +52,7 @@ and ANTENNA_POSITION are identical (positions to 1e-9 m).
 - **`src/kremetart/core/stream_msv4.py:41`** (and `operators/io.py`, `operators/dft_lm*.py`): `UVW` is now
   fk5 toward each snapshot's own zenith, not ENU. For a per-snapshot DFT toward zenith-referenced (l, m),
   that is the right quantity, but l and m are then (ra, dec) offsets of that snapshot's field, not ENU
-  direction cosines. If the operators assumed u = east and v = north, expect a ~0.3° rotation, and |w| up
+  direction cosines. If the operators assumed u = east and v = north, expect a ~0.16° rotation, and |w| up
   to 0.3 mm instead of exactly 0. Note that the zarr written by `prepare_msv4_zarr` has no `UVW`.
 - **`src/kremetart/utils/read_tart_hdf.py:492`** (`prepare_msv4_zarr`): replace the per-file
   `read_hdf_as_msv4` loop with `open_tart(paths)`, or keep it per file using `engine="tart"`.

@@ -14,7 +14,8 @@ contiguous with no attributes:
     phase_elaz         (2,) float64 [90, 0]
 
 The real bundle (nine TART files plus tart2ms Measurement Sets) is downloaded once into ``tests/data``.
-``TART_MSV4_OFFLINE=1`` skips the download, and ``TART_MSV4_DATA=<dir>`` points at an existing copy.
+``TART_MSV4_OFFLINE=1`` skips the download, ``TART_MSV4_DATA=<dir>`` points at an existing copy, and
+``TART_MSV4_REQUIRE_DATA=1`` (set in CI) makes the real-data tests fail instead of skip when it is missing.
 """
 
 import json
@@ -124,12 +125,19 @@ def pytest_sessionstart(session: pytest.Session) -> None:
         print(f"[tart-msv4 tests] test-data download failed ({exc}); real-data tests will skip")
 
 
+def _missing(reason: str) -> None:
+    """Skip a real-data test, or fail it when ``TART_MSV4_REQUIRE_DATA=1``."""
+    if os.environ.get("TART_MSV4_REQUIRE_DATA") == "1":
+        pytest.fail(f"{reason} (TART_MSV4_REQUIRE_DATA=1)")
+    pytest.skip(reason)
+
+
 @pytest.fixture(scope="session")
 def ref_hdf() -> Path:
     """The bundled reference TART file (skips if absent)."""
     path = DATA_DIR / f"{REF_STEM}.hdf"
     if not path.exists():
-        pytest.skip("real-data bundle not available")
+        _missing("real-data bundle not available")
     return path
 
 
@@ -138,7 +146,7 @@ def ref_ms() -> Path:
     """The tart2ms reference MS (uncalibrated, rephased to the zenith at the middle snapshot)."""
     path = DATA_DIR / _BUNDLE_MARKER
     if not path.exists():
-        pytest.skip("reference Measurement Set not available")
+        _missing("reference Measurement Set not available")
     return path
 
 

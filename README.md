@@ -23,8 +23,14 @@ dt = xr.open_datatree("vis_2026-06-09_08_11_43.476804.hdf", engine="tart")
 ```
 
 `xr.open_dataset(path, engine="tart")` returns just the visibility partition. `engine="tart"` accepts a
-single file only. Engine guessing claims only HDF5 files that carry the TART signature (`vis`, `baselines`,
-`timestamp`, and a JSON `config` with `num_antenna`).
+single file only. Always pass `engine="tart"`. The backend's guessing claims only HDF5 files that carry the TART
+signature (`vis`, `baselines`, `timestamp`, and a JSON `config` with `num_antenna`), but xarray tries its
+netCDF engines first, and h5netcdf or netCDF4, when installed, claim every HDF5 file.
+
+Every array on the (time, baseline) grid is lazy: VISIBILITY is read from the file, and FLAG, WEIGHT, UVW,
+TIME_CENTROID and EFFECTIVE_INTEGRATION_TIME are computed on read from small per-file tables. Opening a file
+reads only its metadata, and the opened tree pickles small. xarray's CF decoding keywords (`decode_times`
+etc.) are accepted and ignored.
 
 ### Several files
 
@@ -42,7 +48,7 @@ dt = tart_msv4.open_tart(paths, chunks={})  # dask, one chunk per file
 
 - **Inputs:** `open_tart` takes one path or a sequence of paths. You expand globs and directories
   yourself.
-- **Ordering:** files are sorted by timestamp.
+- **Ordering:** files are sorted by timestamp. Files that overlap in time, or repeat, raise `ValueError`.
 - **Compatibility:** `config` and `baselines` must be identical. `antenna_positions` may differ by up to
   `position_tolerance` (default 1 cm), because TART recalibrates them along with its gains. Any other
   mismatch raises `ValueError`.
