@@ -31,6 +31,8 @@ def _node(part: xr.DataTree, name: str) -> xr.Dataset:
 def assert_schema_ok(tree: xr.DataTree) -> None:
     """Assert that xradio's MSv4 checker reports no issues."""
     check = pytest.importorskip("xradio.schema.check")
+    import xradio.measurement_set  # noqa: F401  (registers the MSv4 schemas with the checker)
+
     issues = check.check_datatree(tree)
     assert not issues, str(issues)
 
@@ -94,7 +96,11 @@ def test_matches_astropy(part) -> None:
                 x=b[:, 0] * u.m, y=b[:, 1] * u.m, z=b[:, 2] * u.m, obstime=t[i], representation_type="cartesian"
             )
             g = itrs.transform_to(GCRS(obstime=t[i])).cartesian.xyz.to_value(u.m).T
-            uvw[i] = g @ geometry.uvw_basis(zen.ra.rad[i : i + 1], zen.dec.rad[i : i + 1])[0].T
+            # Independent (u, v, w) basis: w toward the phase centre, u = pole x w (east), v = w x u (north).
+            w = zen[i].cartesian.xyz.value
+            east = np.cross([0.0, 0.0, 1.0], w)
+            east /= np.linalg.norm(east)
+            uvw[i] = g @ np.stack([east, np.cross(w, east), w]).T
     direction = _node(part, "field_and_source_base_xds").FIELD_PHASE_CENTER_DIRECTION.values
     dra = (direction[:, 0] - zen.ra.rad + np.pi) % (2 * np.pi) - np.pi
     assert np.all(np.abs(dra * np.cos(zen.dec.rad)) < 0.5 * ARCSEC)
@@ -186,3 +192,15 @@ def test_deterministic_and_creation_date(tart_file) -> None:
     other = xr.open_datatree(tart_file, engine="tart", creation_date="2030-01-01T00:00:00")
     attrs = other[name].ds.attrs
     assert attrs["creation_date"] == attrs["data_groups"]["base"]["date"] == "2030-01-01T00:00:00"
+
+
+def test_leap_second_day_dates() -> None:
+    """On a day with a leap second, ERFA's quasi-JD must read back the same clock time (not 1 s later)."""
+    from datetime import datetime, timezone
+
+    from tart_msv4.geometry import _utc_two_part
+
+    t = datetime(2016, 12, 31, 23, 59, 59, 500000, tzinfo=timezone.utc).timestamp()
+    utc1, utc2 = _utc_two_part(np.array([t]))
+    *_, ihmsf = erfa.d2dtf("UTC", 3, utc1, utc2)
+    assert tuple(ihmsf[0]) == (23, 59, 59, 500)

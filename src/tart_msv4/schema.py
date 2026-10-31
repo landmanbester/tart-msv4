@@ -5,13 +5,16 @@ conventions follow xarray-ms, except that VISIBILITY carries ``units="dimensionl
 normalised correlation coefficients, not Jy) and the dates are deterministic (see ``docs/adr``).
 """
 
+import warnings
 from datetime import datetime, timezone
+from functools import partial
 from typing import Any
 
 import numpy as np
 import xarray as xr
 
-from tart_msv4 import geometry
+from tart_msv4 import __version__, geometry
+from tart_msv4.lazy import DerivedArray, expand_table, lazy
 
 TELESCOPE_NAME = "TART"
 SCHEMA_VERSION = "4.0.0"
@@ -36,10 +39,21 @@ def antenna_names(n_antenna: int) -> np.ndarray:
 
 
 def integration_time(time: np.ndarray, scan_index: np.ndarray) -> float:
-    """Return the median snapshot spacing in seconds, ignoring the gaps between files."""
+    """Return the median snapshot spacing in seconds, ignoring the gaps between files.
+
+    Falls back to 1 s, with a warning, when no file has two snapshots.
+    """
     same_scan = np.diff(scan_index) == 0
     spacing = np.diff(time)[same_scan]
-    return float(np.median(spacing)) if spacing.size else 1.0
+    if not spacing.size:
+        warnings.warn("no file has two snapshots; assuming a 1 s integration time", stacklevel=2)
+        return 1.0
+    return float(np.median(spacing))
+
+
+def dead_antennas(gains: np.ndarray) -> np.ndarray:
+    """Return a mask of dead antennas: gain amplitude zero or not finite."""
+    return ~np.isfinite(gains) | (np.asarray(gains) == 0)
 
 
 def build_msv4_groups(
@@ -55,7 +69,6 @@ def build_msv4_groups(
     partition_name: str = "partition_000",
     creation_date: str | None = None,
     dut1: float = 0.0,
-    software_version: str = "",
 ) -> dict[str, xr.Dataset]:
     """Assemble the MSv4 groups of one observation.
 
@@ -67,12 +80,11 @@ def build_msv4_groups(
         antenna_enu: ``(n_scan, n_antenna, 3)`` East/North/Up antenna positions in metres, per file. UVW uses
             each file's own positions; ``antenna_xds`` holds the first file's.
         baselines: ``(n_baseline, 2)`` antenna index pairs.
-        gains: ``(n_scan, n_antenna)`` gain amplitudes; zero marks a dead antenna.
+        gains: ``(n_scan, n_antenna)`` gain amplitudes; zero (or non-finite) marks a dead antenna.
         phases: ``(n_scan, n_antenna)`` gain phases in radians.
         partition_name: Name of the partition node.
         creation_date: ISO creation date. Defaults to the last snapshot time, so the output is deterministic.
         dut1: UT1 - UTC in seconds, used for the phase centres and UVW.
-        software_version: Version string recorded in ``creator``.
 
     Returns:
         Mapping from DataTree group path to dataset: the root, the visibility partition, and its
@@ -86,21 +98,18 @@ def build_msv4_groups(
 
     antenna_enu = np.asarray(antenna_enu, dtype=np.float64)
     ra, dec = geometry.zenith_radec(time, lat, lon, alt, dut1)
-    uvw = np.empty((time.size, baselines.shape[0], 3))
-    for s, enu in enumerate(antenna_enu):
-        itrs = geometry.enu_to_itrs(enu, lat, lon, alt)
-        sel = scan_index == s
-        uvw[sel] = geometry.baseline_uvw(
-            itrs[baselines[:, 0]] - itrs[baselines[:, 1]], time[sel], ra[sel], dec[sel], dut1
-        )
+    # UVW stays lazy: per-snapshot rotations plus each file's own ITRS baselines, projected on read.
+    itrs = np.stack([geometry.enu_to_itrs(enu, lat, lon, alt) for enu in antenna_enu])
+    file_baselines = itrs[:, baselines[:, 0]] - itrs[:, baselines[:, 1]]
+    rot = geometry.uvw_rotation(time, ra, dec, dut1)
+    uvw_shape = (time.size, len(baselines), 3)
+    uvw = DerivedArray(partial(geometry.uvw_rows, rot, file_baselines, scan_index), uvw_shape, float)
 
     p = f"/{partition_name}"
     return {
         "/": xr.Dataset(),
-        p: visibility_xds(
-            vis, time, scan_index, uvw, baselines, gains, names, config, partition_name, date, dut1, software_version
-        ),
-        f"{p}/antenna_xds": antenna_xds(geometry.enu_to_itrs(antenna_enu[0], lat, lon, alt), names, config["name"]),
+        p: visibility_xds(vis, time, scan_index, uvw, baselines, gains, names, config, partition_name, date, dut1),
+        f"{p}/antenna_xds": antenna_xds(itrs[0], names, config["name"]),
         f"{p}/field_and_source_base_xds": field_and_source_xds(field_names(time), ra, dec),
         f"{p}/gain_xds": gain_xds(gains, phases, antenna_enu, time, scan_index, names),
     }
@@ -110,7 +119,7 @@ def visibility_xds(
     vis: Any,
     time: np.ndarray,
     scan_index: np.ndarray,
-    uvw: np.ndarray,
+    uvw: DerivedArray,
     baselines: np.ndarray,
     gains: np.ndarray,
     names: np.ndarray,
@@ -118,22 +127,22 @@ def visibility_xds(
     partition_name: str,
     date: str,
     dut1: float,
-    software_version: str,
 ) -> xr.Dataset:
     """Build the main visibility dataset of a partition (see :func:`build_msv4_groups` for the arguments)."""
     n_time, n_bl = time.size, baselines.shape[0]
     dims4 = ("time", "baseline_id", "frequency", "polarization")
     t_int = integration_time(time, scan_index)
 
-    # Dead antennas are judged per file; one (n_scan, n_baseline) table, expanded once to (time, baseline).
-    dead = np.asarray(gains) == 0
-    bad = (dead[:, baselines[:, 0]] | dead[:, baselines[:, 1]])[scan_index]
-    flag = bad.astype(np.uint8)[:, :, None, None]
-    weight = np.where(bad, 0.0, 1.0).astype(np.float32)[:, :, None, None]
-    time_grid = np.broadcast_to(time[:, None], (n_time, n_bl))
-    t_int_grid = np.broadcast_to(np.float64(t_int), (n_time, n_bl))
+    # Grid arrays are lazy, expanded on read from small tables; dead antennas are judged per file.
+    dead = dead_antennas(gains)
+    bad = (dead[:, baselines[:, 0]] | dead[:, baselines[:, 1]])[:, :, None, None]
+    grid4 = (n_time, n_bl, 1, 1)
+    flag = expand_table(bad.astype(np.uint8), scan_index, grid4)
+    weight = expand_table(np.where(bad, 0.0, 1.0).astype(np.float32), scan_index, grid4)
+    time_grid = expand_table(time[:, None], np.arange(n_time), (n_time, n_bl))
+    t_int_grid = expand_table(np.array([[t_int]]), np.zeros(n_time, dtype=np.int64), (n_time, n_bl))
 
-    scan_starts = np.array([time[scan_index == s][0] for s in range(scan_index.max() + 1)])
+    scan_names = np.array([f"scan_{unix_to_iso(time[scan_index == s][0])}" for s in range(scan_index.max() + 1)])
     frequency = float(config["frequency"])
     coords = {
         "time": ("time", time, {**_TIME_ATTRS, "integration_time": _quantity(t_int, "s")}),
@@ -149,21 +158,14 @@ def visibility_xds(
                 "observer": "TOPO",
                 "spectral_window_name": "L1",
                 "spectral_window_intents": ["UNSPECIFIED"],
-                "reference_frequency": {
-                    "attrs": {"type": "spectral_coord", "units": "Hz", "observer": "TOPO"},
-                    "data": frequency,
-                },
+                "reference_frequency": _quantity(frequency, "Hz", type="spectral_coord", observer="TOPO"),
                 "channel_width": _quantity(float(config["bandwidth"]), "Hz"),
             },
         ),
         "polarization": ("polarization", np.array(["RR"])),
         "uvw_label": ("uvw_label", np.array(["u", "v", "w"])),
         "field_name": ("time", field_names(time)),
-        "scan_name": (
-            "time",
-            np.array([f"scan_{unix_to_iso(t)}" for t in scan_starts])[scan_index],
-            {"scan_intents": ["OBSERVE_TARGET#ON_SOURCE"]},
-        ),
+        "scan_name": ("time", scan_names[scan_index], {"scan_intents": ["OBSERVE_TARGET#ON_SOURCE"]}),
     }
     vis_attrs = {
         "type": "quantity",
@@ -174,7 +176,7 @@ def visibility_xds(
         "VISIBILITY": xr.Variable(dims4, vis, vis_attrs),
         "FLAG": (dims4, flag),
         "WEIGHT": (dims4, weight),
-        "UVW": (("time", "baseline_id", "uvw_label"), uvw, {"type": "uvw", "units": "m", "frame": "fk5"}),
+        "UVW": (("time", "baseline_id", "uvw_label"), lazy(uvw), {"type": "uvw", "units": "m", "frame": "fk5"}),
         "TIME_CENTROID": (("time", "baseline_id"), time_grid, _TIME_ATTRS),
         "EFFECTIVE_INTEGRATION_TIME": (("time", "baseline_id"), t_int_grid, {"type": "quantity", "units": "s"}),
     }
@@ -182,7 +184,7 @@ def visibility_xds(
         "type": "visibility",
         "schema_version": SCHEMA_VERSION,
         "creation_date": date,
-        "creator": {"software_name": "tart-msv4", "version": software_version},
+        "creator": {"software_name": "tart-msv4", "version": __version__},
         "observation_info": {
             "observer": ["unknown"],
             "project_UID": TELESCOPE_NAME,
@@ -263,8 +265,7 @@ def gain_xds(
     scan_index: np.ndarray,
     names: np.ndarray,
 ) -> xr.Dataset:
-    """Build the ``gain_xds`` TART extension: each file's calibration snapshot (gains and ENU antenna
-    positions) on a ``gain_time`` axis."""
+    """Build the ``gain_xds`` TART extension: each file's gains and ENU antenna positions, per ``gain_time``."""
     amp, phase = np.asarray(gains, np.float64), np.asarray(phases, np.float64)
     gain_time = np.array([np.median(time[scan_index == s]) for s in range(amp.shape[0])])
     dims = ("gain_time", "antenna_name")
@@ -277,7 +278,7 @@ def gain_xds(
         "GAIN": (dims, (amp * np.exp(1j * phase)).astype(np.complex64)),
         "GAIN_AMPLITUDE": (dims, amp),
         "GAIN_PHASE": (dims, phase, {"units": "rad"}),
-        "ANTENNA_FLAG": (dims, amp == 0),
+        "ANTENNA_FLAG": (dims, dead_antennas(amp)),
         "ANTENNA_POSITION_ENU": ((*dims, "enu_label"), antenna_enu, {"units": "m", "frame": "ENU"}),
     }
     attrs = {
@@ -290,6 +291,6 @@ def gain_xds(
     return xr.Dataset(data_vars, coords, attrs)
 
 
-def _quantity(value: float, units: str) -> dict[str, Any]:
-    """Encode a scalar quantity attribute the way xarray-ms and xradio expect."""
-    return {"attrs": {"type": "quantity", "units": units}, "data": value}
+def _quantity(value: float, units: str, **attrs: str) -> dict[str, Any]:
+    """Encode a scalar quantity attribute the way xarray-ms and xradio expect (``attrs`` override the type)."""
+    return {"attrs": {"type": "quantity", "units": units, **attrs}, "data": value}

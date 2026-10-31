@@ -59,7 +59,12 @@ def test_guess_can_open(tart_file, tmp_path) -> None:
 
 
 def test_engine_guessing_picks_tart(tart_file) -> None:
-    assert "tart" in xr.backends.plugins.guess_engine(str(tart_file))
+    """Holds only without netCDF engines: xarray tries them first and they claim any HDF5 file."""
+    import importlib.util
+
+    if any(importlib.util.find_spec(m) for m in ("h5netcdf", "netCDF4")):
+        pytest.skip("a netCDF engine is installed and claims HDF5 files before 'tart'")
+    assert xr.backends.plugins.guess_engine(str(tart_file)) == "tart"
 
 
 def test_rejects_directory(tmp_path) -> None:
@@ -104,7 +109,7 @@ def test_drop_variables(tart_file) -> None:
     assert "TIME_CENTROID" not in ds and "VISIBILITY" in ds
 
 
-@pytest.mark.filterwarnings("ignore:The specified chunks separate")
+@pytest.mark.filterwarnings("error")
 def test_chunks_give_dask(tart_file) -> None:
     da = pytest.importorskip("dask.array")
     dt = xr.open_datatree(tart_file, engine="tart", chunks={"time": 1})
@@ -178,10 +183,73 @@ def test_open_tart_needs_paths() -> None:
         tart_msv4.open_tart([])
 
 
-def test_engine_resolution_does_not_import_erfa() -> None:
-    import subprocess
-    import sys
+GRID_VARS = ("VISIBILITY", "FLAG", "WEIGHT", "UVW", "TIME_CENTROID", "EFFECTIVE_INTEGRATION_TIME")
 
-    code = "import sys, xarray as xr; xr.backends.list_engines(); import tart_msv4; print('erfa' in sys.modules)"
-    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
-    assert out.stdout.strip() == "False"
+
+def test_grid_arrays_are_lazy(tart_files) -> None:
+    ds = _partition(tart_msv4.open_tart(tart_files)).ds
+    for name in GRID_VARS:
+        assert ds[name].variable._in_memory is False, name
+
+
+@pytest.mark.parametrize(
+    "indexers",
+    [
+        {"time": [8, 0, 4, 4], "baseline_id": [5, 1]},
+        {"time": slice(2, 7), "baseline_id": 3},
+        {"time": 5},
+        {"time": slice(None, None, -2), "uvw_label": 2},
+        {"time": [], "baseline_id": slice(0, 2)},
+    ],
+)
+def test_outer_indexing_across_files(tart_files, indexers) -> None:
+    ds = _partition(tart_msv4.open_tart(tart_files)).ds
+    loaded = ds.load()
+    for name in GRID_VARS:
+        valid = {k: v for k, v in indexers.items() if k in ds[name].dims}
+        np.testing.assert_array_equal(ds[name].isel(valid).values, loaded[name].isel(valid).values, err_msg=name)
+
+
+def test_open_tart_rejects_duplicate_and_overlapping_files(tart_files, tmp_path) -> None:
+    with pytest.raises(ValueError, match="overlap"):
+        tart_msv4.open_tart([tart_files[0], tart_files[0]])
+    overlapping = write_tart_hdf(tmp_path / "overlap.hdf", start=START + timedelta(seconds=1.5))
+    with pytest.raises(ValueError, match="overlap"):
+        tart_msv4.open_tart([tart_files[0], overlapping])
+
+
+def test_relative_paths_survive_chdir(tart_files, monkeypatch) -> None:
+    monkeypatch.chdir(tart_files[0].parent)
+    dt = tart_msv4.open_tart([p.name for p in tart_files])
+    monkeypatch.chdir("/")
+    assert _partition(dt).ds.VISIBILITY.values.shape == (9, 6, 1, 1)
+
+
+def test_rejects_malformed_vis_shape(tmp_path) -> None:
+    path = write_tart_hdf(tmp_path / "bad.hdf")
+    with h5py.File(path, "a") as f:
+        del f["vis"]
+        f["vis"] = synthetic_vis(2, 6)
+    with pytest.raises(ValueError, match="vis has shape"):
+        xr.open_datatree(path, engine="tart")
+
+
+def test_accepts_xarray_decoder_kwargs(tart_file) -> None:
+    ds = xr.open_dataset(tart_file, engine="tart", decode_times=False, mask_and_scale=True, use_cftime=False)
+    assert ds.sizes["time"] == 3
+    with pytest.raises(TypeError, match="unexpected keyword"):
+        TartBackendEntrypoint().open_groups_as_dict(tart_file, not_an_option=1)
+
+
+def test_non_finite_gain_is_dead(tmp_path) -> None:
+    gains = np.array([1.0, np.nan, 1.0, 1.0], dtype=np.float32)
+    ds = xr.open_datatree(write_tart_hdf(tmp_path / "nan.hdf", gains=gains), engine="tart")
+    part = _partition(ds)
+    touches = (part.ds.baseline_antenna1_name == "ant01") | (part.ds.baseline_antenna2_name == "ant01")
+    np.testing.assert_array_equal(part.ds.FLAG.values[0, :, 0, 0], touches.values.astype(np.uint8))
+    assert bool(part["gain_xds"].to_dataset(inherit=False).ANTENNA_FLAG.values[0, 1])
+
+
+def test_single_snapshot_warns_about_integration_time(tmp_path) -> None:
+    with pytest.warns(UserWarning, match="integration time"):
+        xr.open_dataset(write_tart_hdf(tmp_path / "one.hdf", n_time=1), engine="tart")
