@@ -1,0 +1,62 @@
+[version]
+current = "0.1.0"
+
+# Version format: PEP 440 with optional pre-release and post-release
+regex = '''
+  (?P<major>\d+)
+  \.
+  (?P<minor>\d+)
+  \.
+  (?P<patch>\d+)
+  (?:
+    (?P<channel>a|b|rc)
+    (?P<release>\d+)
+  )?
+  (?:
+    \.post
+    (?P<post>\d+)
+  )?
+  '''
+
+[[field]]
+name = "channel"
+default = ""
+
+[[field]]
+name = "release"
+default = ""
+
+[[field]]
+name = "post"
+default = ""
+
+[git]
+message_template = "chore(release): bump version to {new_version}"
+tag_template = "v{new_version}"
+
+# before_commit hooks run before tbump's version-bump commit.
+# Generate the changelog from the Conventional Commit history and refresh the lock file.
+[[before_commit]]
+name = "Generate changelog"
+cmd = "uvx git-cliff --tag v{new_version} -o CHANGELOG.md"
+
+[[before_commit]]
+name = "Stage changelog"
+cmd = "git add CHANGELOG.md"
+
+[[before_commit]]
+name = "Update uv.lock"
+cmd = "uv lock"
+
+[[before_commit]]
+name = "Stage uv.lock"
+cmd = "git add uv.lock"
+
+# Files to update with the new version
+[[file]]
+src = "pyproject.toml"
+search = 'version = "{current_version}"'
+
+[[file]]
+src = "src/tart_msv4/__init__.py"
+search = '__version__ = "{current_version}"'

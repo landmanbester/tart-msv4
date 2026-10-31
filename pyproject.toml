@@ -1,0 +1,61 @@
+[project]
+name = "tart-msv4"
+version = "0.1.0"
+description = "xarray backend exposing TART visibility HDF5 files as Measurement Set v4 DataTrees"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Landman Bester", email = "lbester@sarao.ac.za" }]
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26",
+    "xarray>=2025.1",
+    "h5py>=3.10",
+    "pyerfa>=2.0.1",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Astronomy",
+    "Framework :: xarray",
+]
+
+[project.urls]
+Repository = "https://github.com/landmanbester/tart-msv4"
+
+[project.entry-points."xarray.backends"]
+tart = "tart_msv4.backend:TartBackendEntrypoint"
+
+[dependency-groups]
+dev = ["ruff>=0.6", "pytest>=8", "pre-commit>=4", "tbump>=6.11.0"]
+test = [
+    "pytest>=8",
+    "gdown>=5",
+    "xradio>=1.3",
+    "xarray-ms>=0.5.13",
+    "arcae>=0.5.8",
+    "dask[array]",
+    "astropy>=6",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.6,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.uv]
+default-groups = ["dev", "test"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--strict-markers"
+filterwarnings = ["ignore:Skipping schema check of .*gain_xds"]
+markers = [
+    "unit: fast tests on synthetic data",
+    "integration: tests against the real TART test-data bundle",
+]
