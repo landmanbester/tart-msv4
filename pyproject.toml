@@ -16,7 +16,6 @@ dependencies = [
 classifiers = [
     "Programming Language :: Python :: 3",
     "Topic :: Scientific/Engineering :: Astronomy",
-    "Framework :: xarray",
 ]
 
 [project.urls]
@@ -35,6 +34,7 @@ test = [
     "arcae>=0.5.8",
     "dask[array]",
     "astropy>=6",
+    "trove-classifiers",
 ]
 
 [build-system]
