@@ -6,7 +6,7 @@
 
 from typing import Any
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 from tart_msv4.backend import open_tart  # noqa: E402  (backend reads __version__ lazily)
 
