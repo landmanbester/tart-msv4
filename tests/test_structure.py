@@ -46,3 +46,13 @@ def test_engine_resolution_does_not_import_erfa() -> None:
     code = "import sys, xarray as xr; xr.backends.list_engines(); import tart_msv4; print('erfa' in sys.modules)"
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
     assert out.stdout.strip() == "False"
+
+
+def test_classifiers_are_valid() -> None:
+    """PyPI rejects uploads with unknown trove classifiers, so catch them before a release."""
+    import tomllib
+
+    trove = pytest.importorskip("trove_classifiers")
+    project = tomllib.loads((SRC.parents[1] / "pyproject.toml").read_text())["project"]
+    invalid = [c for c in project.get("classifiers", []) if c not in trove.classifiers]
+    assert not invalid, f"invalid trove classifiers: {invalid}"
