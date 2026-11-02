@@ -6,7 +6,7 @@
 
 from typing import Any
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 __all__ = ["__version__", "build_msv4_groups", "open_tart"]
 
