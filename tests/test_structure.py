@@ -48,6 +48,14 @@ def test_engine_resolution_does_not_import_erfa() -> None:
     assert out.stdout.strip() == "False"
 
 
+def test_geometry_import_does_not_import_xarray() -> None:
+    """Consumers that only need geometry (e.g. kremetart inside CyberEther's embedded Python, where importing
+    pyarrow deadlocks) must be able to import it without the xarray/pandas stack."""
+    code = "import sys, tart_msv4.geometry; print(sorted(m for m in ('xarray', 'pandas') if m in sys.modules))"
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
+    assert out.stdout.strip() == "[]"
+
+
 def test_classifiers_are_valid() -> None:
     """PyPI rejects uploads with unknown trove classifiers, so catch them before a release."""
     import tomllib

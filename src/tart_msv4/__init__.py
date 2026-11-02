@@ -8,13 +8,16 @@ from typing import Any
 
 __version__ = "0.1.1"
 
-from tart_msv4.backend import open_tart  # noqa: E402  (backend reads __version__ lazily)
-
 __all__ = ["__version__", "build_msv4_groups", "open_tart"]
 
 
 def __getattr__(name: str) -> Any:
     # Lazy: xarray imports this package whenever it resolves any engine, and the schema pulls in pyerfa.
+    # open_tart is lazy too, so `import tart_msv4.geometry` does not drag in xarray/pandas.
+    if name == "open_tart":
+        from tart_msv4.backend import open_tart
+
+        return open_tart
     if name == "build_msv4_groups":
         from tart_msv4.schema import build_msv4_groups
 
